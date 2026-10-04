@@ -1,0 +1,10 @@
+node_modules/
+.env
+*.log
+dist/
+.DS_Store
+.last-url
+.diag.tmp.ts
+verify.tmp.*
+cloudflared.exe
+.codebuddy/
