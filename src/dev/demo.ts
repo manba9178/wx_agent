@@ -2,14 +2,14 @@ import { runAgent } from '../agent/agent.js';
 import { config } from '../config.js';
 
 /**
- * 验收演示脚本：把导师要求的三条任务一次性跑完。
- *   npm run demo                  # 跑默认的三条
+ * 示例脚本：批量跑几个示例问题，观察 Agent 的工具调用过程。
+ *   npm run demo                  # 跑默认的示例
  *   npm run demo -- "任意问题"     # 跑自定义问题
  */
 const DEFAULT_QUERIES = [
   '今天北京天气怎么样？',
   '(1234*5678)+99 等于多少？',
-  '帮我查一下我的 Google Scholar 信息',
+  '查一下戴玮辰的 Google Scholar 引用和代表作',
 ];
 
 async function main(): Promise<void> {
@@ -17,7 +17,7 @@ async function main(): Promise<void> {
   const list = queries.length ? queries : DEFAULT_QUERIES;
 
   console.log('==========================================');
-  console.log(` 验收演示 · 模型 ${config.llm.model}`);
+  console.log(` 示例 · 模型 ${config.llm.model}`);
   console.log('==========================================\n');
 
   for (const [index, query] of list.entries()) {

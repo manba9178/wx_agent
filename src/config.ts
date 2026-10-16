@@ -22,15 +22,6 @@ export const config = {
     model: env('LLM_MODEL', 'deepseek-chat'),
   },
 
-  scholar: {
-    userId: env('SCHOLAR_USER_ID'),
-    name: env('SCHOLAR_NAME'),
-    serpApiKey: env('SERPAPI_KEY'),
-  },
-
-  defaults: {
-    city: env('DEFAULT_CITY', '北京'),
-  },
 } as const;
 
 /** 启动时做一次体检，把明显缺失的配置直接报出来，避免联调时抓瞎 */

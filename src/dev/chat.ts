@@ -12,6 +12,7 @@ async function main(): Promise<void> {
   console.log(' 本地调试模式（不经过企业微信）');
   console.log(` 模型: ${config.llm.model} @ ${config.llm.baseUrl}`);
   console.log(' 试试：今天北京天气怎么样 / (1234*5678)+99 等于多少 / 查一下我的 Google Scholar');
+  console.log(' 提示：现在是通用工具架构，agent 会自己读 skills/ 技能文档再组合工具完成任务');
   console.log(' 输入 q 退出，输入 /reset 清空上下文');
   console.log('====================================\n');
 

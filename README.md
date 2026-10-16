@@ -1,90 +1,213 @@
-# wx-agent · 接在企业微信里的自建 Agent
+<div align="center">
 
-一个跑在**企业微信**里的 AI 助理：你在企业微信里给它发消息，它调用 LLM + 工具帮你**查天气、算数、查 Google Scholar**，再把结果回给你。
+# wx-agent
 
-对应任务：*"写一个 agent 接入你们自己的微信，类似写一个你们自己的 openclaw"*。
+**一个接在企业微信里的 LLM Agent**
+
+用 TypeScript 手写 Agent 内核，通过企业微信官方协议收发消息。
+工具层只提供通用的基础原语，由模型自己组合它们完成任务；领域知识以纯文本技能文档的形式存在，新增能力通常不需要改代码。
+
+[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen?logo=node.js&logoColor=white)](https://nodejs.org)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
+[![License](https://img.shields.io/badge/license-MIT-yellow.svg)](./LICENSE)
+
+</div>
 
 ---
 
-## 一、整体架构（先看懂这张图，后面都是照做）
+## 目录
+
+- [简介](#简介)
+- [特性](#特性)
+- [架构](#架构)
+  - [消息链路](#消息链路)
+  - [Agent 内核](#agent-内核)
+  - [工具层](#工具层)
+  - [技能文档](#技能文档)
+- [快速开始](#快速开始)
+- [配置](#配置)
+- [使用](#使用)
+- [接入企业微信](#接入企业微信)
+- [工具参考](#工具参考)
+- [项目结构](#项目结构)
+- [开发](#开发)
+- [安全](#安全)
+- [常见问题](#常见问题)
+- [许可证](#许可证)
+
+---
+
+## 简介
+
+你在企业微信里给一个自建应用发消息，它会：
+
+1. 收到消息 → 2. 交给大模型 → 3. 模型**自己决定**要不要用工具、用哪些 →
+4. 执行工具 → 5. 模型把结果组织成自然语言 → 6. 主动发回给你。
+
+它的核心是一个手写的决策循环：
 
 ```
-┌─────────────┐   1. 用户发消息      ┌──────────────────────┐
-│  企业微信App │ ──────────────────▶ │  企业微信服务器        │
-│  (工作台/群聊)│                     │  (回调推送)           │
-└─────────────┘                     └──────────┬───────────┘
-       ▲                                       │ 2. POST 加密XML
+用户输入 ──▶ 系统提示词 + 历史 + 工具清单 ──▶ 大模型
+                                              │
+                        ┌─────────────────────┴─────────────────────┐
+                        │ 不要工具：直接回文字                        │
+                        │ 要工具：回 {"name":..., "arguments":...}   │
+                        └─────────────────────┬─────────────────────┘
+                                              ▼
+                                    执行工具（取真实数据）
+                                              │
+                                              ▼
+                                    结果塞回对话，再问一次
+                                    （最多循环 8 次）
+```
+
+内置的能力示例：查天气、做数学运算、查 Google Scholar 学者信息。
+这些能力都不是写死在代码里的，而是模型读取 `skills/` 下的文档后自行组合工具完成的。
+
+---
+
+## 特性
+
+| | 说明 |
+|---|---|
+| 🧠 **手写 Agent 内核** | 不依赖 LangChain 等框架，LLM 调用、决策循环、工具注册、记忆全部自实现 |
+| 🧩 **通用工具层** | 只注册 7 个基础原语，不含任何业务逻辑 |
+| 📚 **技能文档** | 领域知识写在 `skills/*.md`，模型自己读取并照做 |
+| 🔌 **模型无关** | 走 OpenAI 兼容协议，DeepSeek / 通义 / 智谱 / OpenAI 换配置即可 |
+| 💬 **企业微信原生** | 官方通道：回调加解密 + `message/send` 主动推送，支持单聊与群聊 |
+| 🛡 **安全护栏** | 文件操作沙箱化、命令黑名单、超时与输出截断 |
+| 🧪 **本地可调** | `npm run chat` 在终端直接对话，**不需要配企业微信** |
+
+---
+
+## 架构
+
+### 消息链路
+
+```
+┌─────────────┐  1. 用户发消息     ┌──────────────────────┐
+│  企业微信App │ ────────────────▶ │  企业微信服务器        │
+│ (工作台/群聊)│                    │  (回调推送)           │
+└─────────────┘                    └──────────┬───────────┘
+       ▲                                       │ 2. POST 加密 XML
        │ 5. 收到回复                            ▼
        │                            ┌──────────────────────────────┐
-       │                            │  你的服务器 (本项目)          │
-       │                            │  /wecom/callback             │
-       │                            │   ① 验签 + 解密              │
-       │                            │   ② 立刻返回 200 (5秒限制)    │
-       │                            │   ③ 丢给 Agent 异步处理       │
-       │                            │        │                     │
+       │                            │  你的服务器（本项目）          │
+       │                            │  POST /wecom/callback        │
+       │                            │   ① 验签 + AES 解密           │
+       │                            │   ② 立刻返回 200（5 秒限制）   │
+       │                            │   ③ 异步交给 Agent 处理        │
        │                            │        ▼                     │
-       │                            │   Agent 大脑 (LLM 工具调用)   │
-       │                            │   ├─ get_weather  查天气     │
-       │                            │   ├─ calculate    算数       │
-       │                            │   └─ get_google_scholar      │
+       │                            │   Agent 大脑（LLM ↔ 工具）     │
+       │                            │   ├─ web_fetch   联网取数      │
+       │                            │   ├─ run_shell   执行命令      │
+       │                            │   └─ read/write/glob/grep     │
        │                            └──────────┬───────────────────┘
        │                                       │ 4. 调 message/send API
        └───────────────────────────────────────┘
 ```
 
-**两个关键设计点**（面试/验收会被问）：
+企业微信侧有两个绕不开的约束：
 
-1. **必须"先响应、再异步回复"**：企业微信要求回调 5 秒内返回，LLM 不可能这么快。所以我们在收到消息后立刻返回空串，处理完再用 `message/send` 主动推给用户，**不能走被动回复 XML**。
-2. **消息加解密**：企业微信回调是 AES-256-CBC + SHA1 签名的加密 XML，本项目的 `src/wecom/crypto.ts` 是官方 `WXBizMsgCrypt` 的 Node 实现（32 字节 PKCS#7 填充，注意不是常见的 16）。
+1. **先响应、再异步回复**。回调要求 **5 秒内**返回，而 LLM 通常需要更久。
+   所以收到消息后立刻返回空串，处理完再用 `message/send` 主动推给用户，不走被动回复 XML。
+2. **消息加解密**。回调体是 AES-256-CBC + SHA1 签名的加密 XML，
+   `src/wecom/crypto.ts` 是官方 `WXBizMsgCrypt` 的 Node 实现
+   （注意是 32 字节 PKCS#7 填充，不是常见的 16）。
+
+### Agent 内核
+
+内核由四个零件组成：
+
+| 零件 | 文件 | 作用 |
+|---|---|---|
+| LLM 调用 | `src/agent/llm.ts` | OpenAI 兼容 `/chat/completions`，带 `tools` 参数 |
+| 决策循环 | `src/agent/agent.ts` | 观察 → 决定 → 调工具 → 再观察，最多 8 轮 |
+| 工具注册表 | `src/agent/tools/index.ts` | 工具名册 + 统一调度 + 异常兜底 |
+| 记忆 | `src/agent/session.ts` | 按用户保存最近 6 轮对话（内存 Map） |
+
+```ts
+// src/agent/agent.ts —— 内核就是这个循环
+for (let step = 0; step < MAX_STEPS; step += 1) {
+  const message = await chatCompletion(messages, toolSchemas());
+  const toolCalls = message.tool_calls ?? [];
+
+  if (toolCalls.length === 0) {
+    finalText = (message.content ?? '').trim();
+    break;
+  }
+
+  messages.push(message);
+  for (const call of toolCalls) {
+    const args = parseArgs(call.function.arguments);   // 只是 JSON.parse
+    const result = await runTool(call.function.name, args);
+    messages.push({ role: 'tool', tool_call_id: call.id, content: result });
+  }
+}
+```
+
+意图识别、工具选择、参数填写**全部由模型完成**，代码中没有关键词路由或正则抽参。
+
+### 工具层
+
+工具层对外只暴露基础能力，不含业务逻辑：
+
+| 工具 | 能力 |
+|---|---|
+| `web_fetch` | GET 任意 http/https URL |
+| `run_shell` | 执行一条命令 |
+| `read_file` / `write_file` / `edit_file` | 读写与修改文件 |
+| `glob` / `grep` | 按文件名找文件、按内容搜文件 |
+
+### 技能文档
+
+领域知识以纯文本形式放在 `skills/`，模型用 `read_file` 读取后自行组合工具执行：
+
+```
+skills/
+├─ weather.md     # 查天气：Open-Meteo 的 API 地址 + WMO 天气码对照表
+├─ calc.md        # 算数：用 node 计算的命令示例
+├─ scholar.md     # 查学者：脚本用法说明
+└─ scholar.mjs    # 查学者脚本（多步调用 SerpAPI）
+```
+
+一次真实调用的过程：
+
+```
+用户: 今天北京天气怎么样？
+[agent] 调用工具 read_file {"path":"skills/weather.md"}
+[agent] 调用工具 web_fetch {"url":"https://geocoding-api.open-meteo.com/v1/search?..."}
+[agent] 调用工具 web_fetch {"url":"https://api.open-meteo.com/v1/forecast?..."}
+助手: 北京今天阴天，气温约 17℃，体感约 13℃。未来三天……
+
+用户: (1234*5678)+99 等于多少？
+[agent] 调用工具 read_file {"path":"skills/calc.md"}
+[agent] 调用工具 run_shell {"command":"node -e \"console.log((1234*5678)+99)\""}
+助手: (1234×5678)+99 = 7006751
+```
+
+工具层不认识"天气"或"算数"，它只提供取数和执行命令的能力；怎么组合由模型读完文档后决定。
 
 ---
 
-## 二、目录结构
-
-```
-wx_agent/
-├─ src/
-│  ├─ index.ts              # 入口：Express 服务 + 消息处理接线
-│  ├─ config.ts             # 环境变量读取 + 启动体检
-│  ├─ wecom/
-│  │  ├─ crypto.ts          # 企业微信回调加解密（核心）
-│  │  ├─ callback.ts        # 回调路由：URL验证 / 收消息
-│  │  ├─ api.ts             # access_token + 发消息
-│  │  └─ types.ts
-│  ├─ agent/
-│  │  ├─ agent.ts           # Agent 主循环（LLM ↔ 工具）
-│  │  ├─ llm.ts             # OpenAI 兼容 LLM 客户端
-│  │  ├─ session.ts         # 多轮对话记忆
-│  │  └─ tools/
-│  │     ├─ index.ts        # 工具注册表（加工具改这里）
-│  │     ├─ weather.ts      # 查天气（Open-Meteo，免 Key）
-│  │     ├─ calculator.ts   # 算数（mathjs 白名单作用域）
-│  │     └─ scholar.ts      # Google Scholar
-│  └─ dev/
-│     ├─ chat.ts            # 本地终端交互调试（不用配企业微信）
-│     └─ demo.ts            # 一键跑完验收三条任务
-├─ .env.example
-└─ package.json
-```
-
----
-
-## 三、5 分钟先把它跑起来（不用碰企业微信）
+## 快速开始
 
 ```bash
+git clone <your-repo-url>
+cd wx-agent
 npm install
-cp .env.example .env      # Windows: copy .env.example .env
+cp .env.example .env          # Windows: copy .env.example .env
 ```
 
-编辑 `.env`，**最少只填这 3 行**就能本地聊天：
+编辑 `.env`，最少填 LLM 三行即可：
 
 ```ini
-LLM_BASE_URL=https://api.deepseek.com/v1   # 也可换通义/智谱/OpenAI
+LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_API_KEY=sk-你的key
 LLM_MODEL=deepseek-chat
 ```
 
-然后：
+在终端直接对话：
 
 ```bash
 npm run chat
@@ -92,181 +215,280 @@ npm run chat
 
 ```
 你 > (1234*5678)+99 等于多少
-助手 > 1234×5678 = 7006652，再加 99 等于 7006751。
+助手 > (1234×5678)+99 = 7006751
 
 你 > 今天北京天气怎么样
-助手 > 北京现在晴间多云，25.9°C，体感 27.1°C……
+助手 > 北京现在阴天，17℃，体感 13℃……
 ```
 
-**这一步跑通了，说明 Agent 大脑没问题，剩下的只是"接线"到企业微信。**
-
-想一键跑完验收三条任务，用：
-
-```bash
-npm run demo                      # 自动跑「查天气 / 算数 / 查 Scholar」三条
-npm run demo -- "上海明天会下雨吗"  # 也可以跑自定义问题
-```
+这一步不需要配置企业微信。确认 Agent 行为正常后，再按[接入企业微信](#接入企业微信)接线。
 
 ---
 
-## 四、正式接入企业微信（详细步骤）
+## 配置
 
-### 0. 前置条件
+复制 `.env.example` 为 `.env` 后按需填写。启动时 `assertConfig()` 会检查必填项，缺失时直接打印提示。
 
-- 一个企业微信账号（**个人也能免费注册**：<https://work.weixin.qq.com/>，注册时选"企业"随便填个名）
-- 你是该企业的**管理员**
-- 一个**公网可访问的地址**（本地开发用内网穿透，见第 5 步）
-
----
-
-### 1. 拿到企业 ID（corpid）
-
-管理后台 → **我的企业** → **企业信息** → 拉到底 → **企业ID**
-
-形如 `ww1234567890abcdef`，填进 `.env` 的 `WECOM_CORP_ID`。
-
----
-
-### 2. 创建自建应用，拿 AgentId / Secret
-
-管理后台 → **应用管理** → **应用** → 「自建」那一栏 → **创建应用**
-
-- 上传 logo、应用名称（比如"课题组小助理"）
-- **可见范围**：勾上你自己和课题组成员（决定谁能用）
-- 创建完成后进入应用详情页，抄下两个值：
-  - **AgentId**（形如 `1000002`）→ `WECOM_AGENT_ID`
-  - **Secret**（点"获取"，只显示一次，泄露了可以重置）→ `WECOM_SECRET`
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `LLM_BASE_URL` | ✅ | OpenAI 兼容接口地址，末尾不带 `/` |
+| `LLM_API_KEY` | ✅ | 模型 API Key |
+| `LLM_MODEL` | ✅ | 模型名，如 `deepseek-chat` |
+| `WECOM_CORP_ID` | 企微 | 企业 ID（`ww` 开头） |
+| `WECOM_AGENT_ID` | 企微 | 自建应用 AgentId |
+| `WECOM_SECRET` | 企微 | 自建应用 Secret |
+| `WECOM_CALLBACK_TOKEN` | 企微 | 回调 Token |
+| `WECOM_ENCODING_AES_KEY` | 企微 | 回调 AESKey，**必须 43 位** |
+| `WECOM_PORT` | ➖ | 服务端口，默认 `3000` |
+| `SERPAPI_KEY` | ➖ | 查 Google Scholar 用到，免费额度 100 次/月 |
 
 ---
 
-### 3. 配置「接收消息」回调（最关键的一步）
+## 使用
 
-在同一个应用详情页 → 找到 **接收消息** → **设置 API 接收**
+| 命令 | 作用 |
+|---|---|
+| `npm run chat` | 终端里与 Agent 对话 |
+| `npm run demo` | 依次跑三个示例问题 |
+| `npm run demo -- "上海明天会下雨吗"` | 跑自定义问题 |
+| `npm run dev` | 启动服务（`tsx watch` 热重载） |
+| `npm start` | 启动服务 |
+| `npm run typecheck` | 类型检查 |
 
-会弹出一个表单，三行：
+对话中输入 `/reset`（或 `/clear`、`重置`、`清空`）可清空当前会话上下文。
+
+Windows 下另有几个辅助脚本，用于配合内网穿透调试：
+
+| 脚本 | 作用 |
+|---|---|
+| `start.bat` | 启动服务 + cloudflared 隧道 |
+| `status.bat` | 查看服务与隧道状态 |
+| `get-url.bat` | 读取当前公网地址并复制到剪贴板 |
+| `stop.bat` | 停止服务与隧道 |
+
+---
+
+## 接入企业微信
+
+### 1. 创建自建应用
+
+管理后台 → 应用管理 → 应用 → 自建 → 创建应用。
+记下 **AgentId** 和 **Secret**；企业 ID 在「我的企业 → 企业信息」底部。
+
+### 2. 配置接收消息回调
+
+应用详情 → 接收消息 → 设置 API 接收：
 
 | 字段 | 填什么 |
 |---|---|
-| **URL** | `https://你的公网域名/wecom/callback` |
-| **Token** | 点「随机获取」，然后**原样复制**到 `.env` 的 `WECOM_CALLBACK_TOKEN` |
-| **EncodingAESKey** | 点「随机获取」（会得到 43 位），**原样复制**到 `.env` 的 `WECOM_ENCODING_AES_KEY` |
+| URL | `https://你的公网域名/wecom/callback` |
+| Token | 点「随机获取」，填到 `WECOM_CALLBACK_TOKEN` |
+| EncodingAESKey | 点「随机获取」（43 位），填到 `WECOM_ENCODING_AES_KEY` |
 
-填好 `.env` 后，**先把服务启动起来**：
+先把服务跑起来（`npm run dev`），**再回后台点保存**：企业微信会立刻 GET 该 URL 做验证。
 
-```bash
-npm run dev
-```
+### 3. 配置企业可信 IP
 
-服务日志会打印 `✅ wx-agent 已启动`。此时**再回后台点「保存」**——企业微信会立刻向你填的 URL 发一个 GET 请求做验证，验证通过才会提示"保存成功"。
+应用详情 → 开发者接口 → 企业可信 IP → 填公网出口 IP。
+不配会报 `errcode: 60020, not allow to access from your ip`。
 
-> 保存失败排查：
-> - 报"请检查URL是否可用" → 服务没起来 / 内网穿透断了 / 路径不是 `/wecom/callback`
-> - 报"回调模式配置失败" → Token 或 EncodingAESKey 粘错了（AESKey 必须是 43 位）
-> - 服务日志出现 `URL 验证签名不通过` → Token 填错了
+### 4. 内网穿透
 
----
+企业微信需要能访问到回调地址，本地开发需要有公网地址：
 
-### 4. 配置「企业可信IP」（不配会报 60020）
-
-应用详情页 → **开发者接口** → **企业可信IP** → 填你服务器的**公网出口 IP**。
-
-不配的话，发消息 API 会返回：
-
-```
-errcode: 60020, errmsg: not allow to access from your ip
-```
-
-本地开发如果不确定出口 IP，可以先访问 <https://ifconfig.me> 查，或者临时把穿透服务的 IP 填进去。
-
----
-
-### 5. 内网穿透（把本地服务暴露到公网）
-
-企业微信必须能访问到你的回调地址。本地开发三选一：
-
-| 工具 | 特点 | 命令示例 |
-|---|---|---|
-| **cpolar** | 国内、免费、有 https | `cpolar http 3000` |
-| **natapp** | 国内、免费隧道 | `natapp -authtoken=xxx` |
-| **frp** | 自己有服务器就用这个 | `frpc -c frpc.ini` |
-
-拿到类似 `https://xxxx.cpolar.cn` 的地址后，回调 URL 就填：
-
-```
-https://xxxx.cpolar.cn/wecom/callback
-```
-
-> ⚠️ 免费版穿透域名会变，**变一次就要回企业微信后台重填一次 URL**。演示前一天记得确认地址没变。
-
----
-
-### 6. 发起对话
-
-两种方式都能用：
-
-**方式 A · 单聊**：手机/桌面企业微信 → **工作台** → 找到你的应用 → 点进去发消息。
-
-**方式 B · 群聊（更接近"群机器人"的体验）**：在企业微信里建一个群 → **群设置 → 群机器人 → 添加** → 选你的自建应用 → 然后在群里 `@应用名` 提问。
-
-日志里看到这样一行就说明链路通了：
-
-```
-[wecom] <- ZhangSan: 今天北京天气怎么样
-[agent] 调用工具 get_weather {"city":"北京"}
-[wecom] -> ZhangSan: 北京现在晴间多云...
-```
-
----
-
-## 五、验收演示（对着导师的要求逐条演示）
-
-| 导师要求 | 演示话术 | 预期表现 |
-|---|---|---|
-| **查天气** | `上海明天会下雨吗` | 调用 `get_weather`，给出天气 + 未来三天 + 降水概率 |
-| **算数** | `(1234*5678)+99 等于多少` | 调用 `calculate`，返回 `7006751`（不是模型心算） |
-| **查 Google Scholar** | `查一下我的 Google Scholar`<br>`戴玮辰的引用有多少` | 调用 `get_google_scholar`，返回引用数 / h-index / i10 / 代表作 |
-| **多轮上下文** | 先问`北京天气`，再问`那明天呢` | 能接上下文 |
-| **兜底** | 随便闲聊 / 问它做不到的事 | 正常对话，不编造数据 |
-
-**演示前必做**：
-
-1. `.env` 里填好导师的 Scholar ID —— 打开导师主页，URL 里 `user=` 后面那串就是，填到 `SCHOLAR_USER_ID`。
-2. Google Scholar 反爬很凶，**强烈建议配 `SERPAPI_KEY`**（<https://serpapi.com> 免费 100 次/月），否则服务器 IP 直接抓大概率被拦。
-3. `npm run chat` 先把三条演示话术各跑一遍，确认都正常再上线。
-
----
-
-## 六、我想改点什么
-
-| 需求 | 改哪里 |
+| 工具 | 命令 |
 |---|---|
-| 换 AI 模型 | `.env` 的 `LLM_BASE_URL` / `LLM_MODEL`（任何 OpenAI 兼容接口都行） |
-| 改人设/语气 | `src/agent/agent.ts` 里的 `SYSTEM_PROMPT` |
-| 加一个新工具（比如查课表） | 在 `src/agent/tools/` 新建文件实现 `Tool` 接口，然后在 `tools/index.ts` 的数组里加一行 |
-| 换会话存储 | `src/agent/session.ts`（现在是内存 Map，重启就丢，生产请换 Redis/SQLite） |
-| 限制模型能用的工具 | `src/agent/agent.ts` 里给 `toolSchemas()` 加过滤 |
+| cloudflared（仓库内含 `cloudflared.exe`） | `cloudflared tunnel --url http://localhost:3000` |
+| cpolar | `cpolar http 3000` |
+| ngrok | `ngrok http 3000` |
+
+> ⚠️ 免费穿透的域名会变，域名变了需要回后台更新回调 URL。
+
+### 5. 发起对话
+
+- **单聊**：企业微信 → 工作台 → 你的应用 → 发消息
+- **群聊**：建群 → 群设置 → 群机器人 → 添加应用 → 在群里 `@应用名` 提问
 
 ---
 
-## 七、常见问题
+## 工具参考
 
-**Q：为什么不直接接个人微信？**
-个人微信没有官方 API，第三方方案（wechaty/puppet、hook 注入）都属于**违反微信协议**，账号随时被封。企业微信是腾讯官方开放的合规通道，这才是"接入自己的微信"的正确解法。
+### `web_fetch`
 
-**Q：`errmsg: invalid ip xxx, not in whitelist`？**
-就是第 4 步的「企业可信IP」没配。
+发起 GET 请求抓取 URL 内容。
 
-**Q：回复很慢？**
-LLM 本身要 2~5 秒。想要更好的体验可以在 `index.ts` 里收到消息后先回一句"🤔 正在处理…"再回结果（多一次 API 调用）。
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `url` | string | ✅ | 完整 URL，仅支持 http / https |
+| `maxLength` | number | ➖ | 最多返回字符数，默认 8000 |
 
-**Q：Google Scholar 抓不到？**
-配 `SERPAPI_KEY`。或者用一个更稳的替代方案：直接写死几位目标学者的 `SCHOLAR_USER_ID`。
+### `run_shell`
 
-**Q：企业微信后台保存回调 URL 一直失败？**
-按第 3 步的排查清单走，90% 是 Token/AESKey 粘错，或者服务压根没启动。
+在项目目录下执行一条命令（Windows 走 `cmd.exe`），返回标准输出。
 
-**Q：启动报 `EADDRINUSE: address already in use :::3000`？**
-3000 端口被别的程序占了（本机就有一个）。改 `.env` 里的 `WECOM_PORT=3300` 重启即可，注意内网穿透的端口要跟着改。
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `command` | string | ✅ | 完整命令，长度上限 2000 字符 |
 
-**Q：日志里中文是乱码？**
-Windows 控制台编码问题，不是代码问题。执行 `chcp 65001` 切到 UTF-8 即可。
+### `read_file`
+
+读取项目内某个文本文件。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `path` | string | ✅ | 相对项目根目录的路径 |
+
+### `write_file`
+
+整份写入文件（覆盖原内容，目录不存在时自动创建）。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `path` | string | ✅ | 相对项目根目录的路径 |
+| `content` | string | ✅ | 完整文本内容 |
+
+### `edit_file`
+
+把 `old_string` 精确替换为 `new_string`。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `path` | string | ✅ | 相对项目根目录的路径 |
+| `old_string` | string | ✅ | 要替换的原文，需与文件内容完全一致 |
+| `new_string` | string | ✅ | 替换后的文本 |
+| `replace_all` | boolean | ➖ | 是否替换全部匹配，默认只替换第一处 |
+
+### `glob`
+
+按通配符查找文件，返回相对路径列表。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `pattern` | string | ✅ | 支持 `*`、`**`、`?`，如 `**/*.ts` |
+| `path` | string | ➖ | 限定在某个子目录内搜索 |
+
+### `grep`
+
+按正则搜索文件内容，返回 `文件:行号: 内容`。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `pattern` | string | ✅ | 正则表达式 |
+| `path` | string | ➖ | 限定在某个子目录内搜索 |
+| `include` | string | ➖ | 只搜匹配该通配符的文件，如 `*.ts` |
+| `max_results` | number | ➖ | 最多返回条数，默认 100 |
+
+---
+
+## 项目结构
+
+```
+wx-agent/
+├─ src/
+│  ├─ index.ts                 # 入口：Express 服务 + 消息处理接线
+│  ├─ config.ts                # 环境变量读取 + 启动检查
+│  ├─ agent/
+│  │  ├─ agent.ts              # Agent 主循环 + 系统提示词
+│  │  ├─ llm.ts                # OpenAI 兼容 LLM 客户端
+│  │  ├─ session.ts            # 多轮对话记忆
+│  │  └─ tools/
+│  │     ├─ index.ts           #   工具注册表
+│  │     ├─ types.ts           #   Tool 接口定义
+│  │     ├─ web.ts             #   web_fetch
+│  │     ├─ shell.ts           #   run_shell
+│  │     ├─ fs.ts              #   read/write/edit_file + glob + grep
+│  │     └─ workspace.ts       #   沙箱路径 / 输出截断
+│  ├─ wecom/
+│  │  ├─ crypto.ts             # 回调加解密（WXBizMsgCrypt 的 Node 实现）
+│  │  ├─ callback.ts           # 回调路由：URL 验证 / 收消息
+│  │  ├─ api.ts                # access_token 缓存 + 发消息
+│  │  ├─ tunnel.ts             # 读取当前公网地址
+│  │  └─ types.ts
+│  └─ dev/
+│     ├─ chat.ts               # 终端交互调试
+│     └─ demo.ts               # 批量跑示例问题
+├─ skills/                     # 技能文档
+│  ├─ weather.md
+│  ├─ calc.md
+│  ├─ scholar.md
+│  └─ scholar.mjs
+├─ .env.example
+├─ tsconfig.json
+├─ LICENSE
+└─ README.md
+```
+
+---
+
+## 开发
+
+新增能力时，优先在 `skills/` 添加技能文档，而不是新增工具：写清楚"用哪些工具、按什么步骤做"，并在 `src/agent/agent.ts` 的 `SYSTEM_PROMPT` 中提一句。
+
+确实需要新的基础能力时，实现 `Tool` 接口并注册到 `src/agent/tools/index.ts`：
+
+```ts
+export interface Tool {
+  name: string;                                        // 工具名
+  description: string;                                 // 描述「什么时候用」，影响模型是否调用
+  parameters: Record<string, unknown>;                 // JSON Schema 参数定义
+  run(args: Record<string, unknown>): Promise<string>; // 执行，返回纯文本给模型
+}
+```
+
+其他常见改动位置：
+
+| 想改什么 | 改哪里 |
+|---|---|
+| 人设 / 语气 | `src/agent/agent.ts` 的 `SYSTEM_PROMPT` |
+| 循环轮数上限 | `src/agent/agent.ts` 的 `MAX_STEPS`（当前 8） |
+| 记忆轮数 / 存储方式 | `src/agent/session.ts`（当前为内存 Map，重启丢失） |
+| 换模型 | `.env` 的 `LLM_BASE_URL` / `LLM_MODEL` |
+
+---
+
+## 安全
+
+工具层能执行命令与读写文件，因此设置了三层护栏：
+
+| 层 | 措施 |
+|---|---|
+| 文件系统 | 路径经 `resolveInWorkspace()` 解析，越出项目目录直接拒绝 |
+| 命令执行 | `run_shell` 维护危险命令黑名单（`format` / `shutdown` / `Remove-Item -Recurse` / `reg delete` 等），20 秒超时 |
+| 输出长度 | 工具返回值统一截断到 8000 字符，避免超大输出灌爆上下文 |
+
+> ⚠️ 以上是护栏而非沙箱。若在生产环境开放 `run_shell`，建议配合容器或受限系统用户使用。
+
+---
+
+## 常见问题
+
+**Q：为什么不接个人微信？**
+个人微信没有官方 API，第三方方案（wechaty、hook 注入）都违反微信协议，账号随时可能被封。企业微信是官方开放的合规通道。
+
+**Q：换模型要改代码吗？**
+不需要。LLM 交互走 OpenAI 兼容协议，改 `.env` 的 `LLM_BASE_URL` 和 `LLM_MODEL` 即可。
+
+**Q：`errcode: 60020, not allow to access from your ip`？**
+企业可信 IP 未配置，见[接入企业微信](#接入企业微信)第 3 步。
+
+**Q：后台保存回调 URL 一直失败？**
+多数是 Token / AESKey 粘错，或服务未启动。EncodingAESKey 必须是 43 位。
+
+**Q：Google Scholar 查不到？**
+需要配置 `SERPAPI_KEY`（国内无法直连 scholar.google.com，需经 SerpAPI 中转）。
+另外查询中国学者要使用拼音名（如戴玮辰 → `Weichen Dai`），中文名匹配不到英文主页。
+
+**Q：回复比较慢？**
+LLM 本身需要几秒。服务收到消息后会先回一句"🤔 正在处理…"再回结果。
+
+**Q：`EADDRINUSE: address already in use :::3000`？**
+端口被占用。改 `.env` 的 `WECOM_PORT`，内网穿透端口同步修改。
+
+**Q：日志里中文乱码？**
+Windows 控制台编码问题，执行 `chcp 65001` 切换到 UTF-8。
+
+---
+
+## 许可证
+
+[MIT](./LICENSE) © 2026 wx-agent contributors
