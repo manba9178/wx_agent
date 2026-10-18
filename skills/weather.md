@@ -1,3 +1,8 @@
+---
+name: weather
+description: 查询城市实时天气和未来三天预报（温度、体感温度、降水概率、风力）
+---
+
 # 技能：查询天气
 
 数据源：**Open-Meteo**（免费、无需 API Key）。

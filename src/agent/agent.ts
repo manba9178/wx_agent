@@ -2,10 +2,11 @@ import { config } from '../config.js';
 import { chatCompletion, type ChatMessage } from './llm.js';
 import { appendTurn, getHistory, resetSession } from './session.js';
 import { runTool, toolSchemas } from './tools/index.js';
+import { loadSkillIndex, renderSkillIndex } from './skills.js';
 
 const MAX_STEPS = 8;
 
-const SYSTEM_PROMPT = `你是「课题组小助手」，一个运行在企业微信里的 AI 助理。
+const BASE_PROMPT = `你是「课题组小助手」，一个运行在企业微信里的 AI 助理。
 
 你手上没有针对某个需求的"专用工具"，只有一组通用的原子工具，任何任务都要你自己组合它们完成：
 - run_shell：执行一条 Windows 命令。算数、跑脚本、调命令行 API 都靠它。
@@ -13,18 +14,30 @@ const SYSTEM_PROMPT = `你是「课题组小助手」，一个运行在企业微
 - read_file / write_file / edit_file：读取、写入、修改项目里的文件。
 - glob / grep：按文件名找文件、按内容搜文件。
 
-做具体任务前，先读对应的「技能文档」（放在 skills/ 目录），按文档里的方法组合工具：
-- 查天气 → 先 read_file 读 skills/weather.md，再用 web_fetch 调里面的 API
-- 查 Google Scholar → 先 read_file 读 skills/scholar.md，再用 run_shell 跑里面的脚本
-- 数学计算 → 先 read_file 读 skills/calc.md，再用 run_shell 跑 node 计算
-
 工作原则：
 - 先真正取到数据或算出结果，再回答；绝不凭记忆编造事实。
 - 工具返回原始数据后，用简洁自然的中文总结给用户，不要直接甩原始数据。
-- 查中国学者的 Google Scholar 时，先把中文名转成英文拼音（如「戴玮辰」→「Weichen Dai」），否则搜不到主页。
 - 企业微信是聊天场景：回复要短，多用短句，不要写长篇大论，不要用 Markdown 表格。
 - 用户用中文提问就用中文回答。
 - 你无法查询企业通讯录、无法操作别人的账号，遇到这类请求直接说明做不到。`;
+
+/**
+ * 组装系统提示词：基础人设 + 从 skills/ 目录实时扫出来的技能清单。
+ * 清单是运行时生成的，所以往目录里丢新技能文档就立刻生效，这里一行都不用改。
+ */
+function buildSystemPrompt(): string {
+  const index = renderSkillIndex(loadSkillIndex());
+  if (!index) return BASE_PROMPT;
+
+  return `${BASE_PROMPT}
+
+可用技能（按需加载，用不上就不要读）：
+${index}
+
+用户的需求匹配上面某个技能时，先用 read_file 读那份文档，再按文档里写的方法组合工具完成。
+技能文档是「操作手册」不是「答案」——里面写的是调什么 API、跑什么命令，真实数据要你自己去取。
+需求不匹配任何技能时，用原子工具自己想办法。`;
+}
 
 export async function runAgent(userId: string, userText: string): Promise<string> {
   const text = userText.trim();
@@ -36,7 +49,7 @@ export async function runAgent(userId: string, userText: string): Promise<string
   }
 
   const messages: ChatMessage[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: buildSystemPrompt() },
     ...getHistory(userId),
     { role: 'user', content: text },
   ];

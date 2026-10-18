@@ -61,7 +61,7 @@
                                     （最多循环 8 次）
 ```
 
-内置的能力示例：查天气、做数学运算、查 Google Scholar 学者信息。
+内置的能力示例：查天气、做数学运算、查 Google Scholar 学者信息、汇率换算。
 这些能力都不是写死在代码里的，而是模型读取 `skills/` 下的文档后自行组合工具完成的。
 
 ---
@@ -161,15 +161,40 @@ for (let step = 0; step < MAX_STEPS; step += 1) {
 
 ### 技能文档
 
-领域知识以纯文本形式放在 `skills/`，模型用 `read_file` 读取后自行组合工具执行：
+领域知识以纯文本形式放在 `skills/`，**一个 `.md` 文件就是一项技能**：
 
 ```
 skills/
 ├─ weather.md     # 查天气：Open-Meteo 的 API 地址 + WMO 天气码对照表
 ├─ calc.md        # 算数：用 node 计算的命令示例
 ├─ scholar.md     # 查学者：脚本用法说明
+├─ fx.md          # 汇率换算：frankfurter API
 └─ scholar.mjs    # 查学者脚本（多步调用 SerpAPI）
 ```
+
+每份文档顶部用 frontmatter 声明元信息：
+
+```markdown
+---
+name: weather
+description: 查询城市实时天气和未来三天预报（温度、体感温度、降水概率、风力）
+---
+```
+
+`src/agent/skills.ts` 会在**每次请求时**扫描这个目录，把「名字 + 一句话描述」组装成清单注入提示词，
+然后由模型**自己判断**要不要用 `read_file` 加载某一份的全文：
+
+```
+用户提问 → 模型看清单（只有名字和一句话，很便宜）
+         → 判断匹配哪个技能
+         → read_file 读该文档全文
+         → 按文档写的步骤组合原子工具执行
+```
+
+这个思路叫 **progressive disclosure**（渐进式披露）：先给便宜的摘要，需要时才加载昂贵的全文。
+
+因为清单是扫描目录得来的，**新增一项能力 = 往 `skills/` 丢一个带 frontmatter 的 `.md`**：
+不改提示词、不注册、不重启，下一次对话就能用。
 
 一次真实调用的过程：
 
@@ -391,6 +416,7 @@ wx-agent/
 │  │  ├─ agent.ts              # Agent 主循环 + 系统提示词
 │  │  ├─ llm.ts                # OpenAI 兼容 LLM 客户端
 │  │  ├─ session.ts            # 多轮对话记忆
+│  │  ├─ skills.ts             #   扫描 skills/ 目录，生成技能清单
 │  │  └─ tools/
 │  │     ├─ index.ts           #   工具注册表
 │  │     ├─ types.ts           #   Tool 接口定义
@@ -407,10 +433,11 @@ wx-agent/
 │  └─ dev/
 │     ├─ chat.ts               # 终端交互调试
 │     └─ demo.ts               # 批量跑示例问题
-├─ skills/                     # 技能文档
+├─ skills/                     # 技能文档（一个 .md = 一项技能）
 │  ├─ weather.md
 │  ├─ calc.md
 │  ├─ scholar.md
+│  ├─ fx.md
 │  └─ scholar.mjs
 ├─ .env.example
 ├─ tsconfig.json
@@ -422,7 +449,20 @@ wx-agent/
 
 ## 开发
 
-新增能力时，优先在 `skills/` 添加技能文档，而不是新增工具：写清楚"用哪些工具、按什么步骤做"，并在 `src/agent/agent.ts` 的 `SYSTEM_PROMPT` 中提一句。
+新增能力时，优先在 `skills/` 添加技能文档，而不是新增工具。新建一个 `.md`，顶部写好 frontmatter，正文写清楚"用哪些工具、按什么步骤做"：
+
+```markdown
+---
+name: course
+description: 一句话说清这项技能解决什么问题、什么时候该用它
+---
+
+# 技能：……
+
+正文写清楚：调什么 API / 跑什么命令、参数怎么填、结果怎么整理。
+```
+
+保存即生效——不需要改提示词、不需要注册、不需要重启服务。`description` 写得好不好直接决定模型能不能正确匹配到它。
 
 确实需要新的基础能力时，实现 `Tool` 接口并注册到 `src/agent/tools/index.ts`：
 
@@ -439,7 +479,7 @@ export interface Tool {
 
 | 想改什么 | 改哪里 |
 |---|---|
-| 人设 / 语气 | `src/agent/agent.ts` 的 `SYSTEM_PROMPT` |
+| 人设 / 语气 | `src/agent/agent.ts` 的 `BASE_PROMPT` |
 | 循环轮数上限 | `src/agent/agent.ts` 的 `MAX_STEPS`（当前 8） |
 | 记忆轮数 / 存储方式 | `src/agent/session.ts`（当前为内存 Map，重启丢失） |
 | 换模型 | `.env` 的 `LLM_BASE_URL` / `LLM_MODEL` |

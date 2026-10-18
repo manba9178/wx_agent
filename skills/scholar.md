@@ -1,3 +1,8 @@
+---
+name: scholar
+description: 查询学者的 Google Scholar 信息（所属机构、研究方向、引用总数、h-index、代表作）
+---
+
 # 技能：查询 Google Scholar 学者信息
 
 国内网络无法直连 `scholar.google.com`，必须经 **SerpAPI** 中转。
